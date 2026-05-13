@@ -1,6 +1,6 @@
 package com.example.flinkkafkasandbox;
 
-import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.core.execution.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -34,8 +34,6 @@ public class OrderStreamingJob {
         uniqueOrders
                 .map(OrderJson::addProcessedAt)
                 .name("Add processedAt field")
-                .map(OrderJson::addLearningStep)
-                .name("Add learning step")
                 .sinkTo(KafkaTopics.stringSink(JobConfig.ENRICHED_ORDERS_TOPIC))
                 .name("Write enriched orders to Kafka");
 
