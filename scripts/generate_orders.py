@@ -15,9 +15,17 @@ EVENT_TYPES = [
 ]
 
 CURRENCIES = ["TRY", "USD", "EUR", "GBP"]
-LATE_EVENT_RATE = 0.20
-DUPLICATE_EVENT_RATE = 0.15
+LATE_EVENT_RATE = 0.15
+DUPLICATE_EVENT_RATE = 0.10
+INVALID_EVENT_RATE = 0.10
 MAX_LATE_SECONDS = 30
+
+INVALID_SCENARIOS = [
+    "negative_amount",
+    "missing_currency",
+    "invalid_event_type",
+    "malformed_json",
+]
 
 LAST_EVENT = None
 
@@ -42,6 +50,24 @@ def create_order_event() -> dict:
     }
 
 
+def make_invalid_event(event: dict) -> dict | str:
+    scenario = random.choice(INVALID_SCENARIOS)
+
+    if scenario == "negative_amount":
+        event["amount"] = -round(random.uniform(1, 500), 2)
+        return event
+
+    if scenario == "missing_currency":
+        event.pop("currency", None)
+        return event
+
+    if scenario == "invalid_event_type":
+        event["eventType"] = "unknown-event-type"
+        return event
+
+    return '{"eventId": "bad-json", "amount": '
+
+
 def main() -> None:
     global LAST_EVENT
 
@@ -52,7 +78,14 @@ def main() -> None:
             event = create_order_event()
             LAST_EVENT = deepcopy(event)
 
-        print(json.dumps(event), flush=True)
+        if random.random() < INVALID_EVENT_RATE:
+            event = make_invalid_event(deepcopy(event))
+
+        if isinstance(event, str):
+            print(event, flush=True)
+        else:
+            print(json.dumps(event), flush=True)
+
         time.sleep(3)
 
 
