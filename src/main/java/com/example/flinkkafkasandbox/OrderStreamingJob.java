@@ -5,7 +5,7 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
-import org.apache.flink.streaming.api.windowing.time.Time;
+import java.time.Duration;
 
 public class OrderStreamingJob {
     public static void main(String[] args) throws Exception {
@@ -41,7 +41,7 @@ public class OrderStreamingJob {
                 .filter(OrderJson::isPaymentCompleted)
                 .name("Keep payment-completed orders")
                 .keyBy(OrderJson::currency)
-                .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+                .window(TumblingEventTimeWindows.of(Duration.ofMinutes(1)))
                 .aggregate(new GmvAggregate(), new AddGmvWindowMetadata())
                 .name("Compute 1-minute GMV by currency")
                 .sinkTo(KafkaTopics.stringSink(JobConfig.GMV_BY_MINUTE_TOPIC))
