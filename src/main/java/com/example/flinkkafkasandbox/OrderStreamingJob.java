@@ -12,7 +12,7 @@ public class OrderStreamingJob {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
 
-        // Checkpoint lesson: Flink periodically snapshots state + Kafka progress for recovery.
+        // Snapshot state and Kafka offsets every 10 s so the job can recover without data loss.
         env.enableCheckpointing(10_000, CheckpointingMode.EXACTLY_ONCE);
         env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5_000);
 
@@ -55,6 +55,6 @@ public class OrderStreamingJob {
                 .sinkTo(KafkaTopics.stringSink(JobConfig.INVALID_ORDERS_TOPIC))
                 .name("Write invalid orders to DLQ");
 
-        env.execute("Kafka Orders Learning Job");
+        env.execute("Order GMV Streaming Job");
     }
 }

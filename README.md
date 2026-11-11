@@ -1,286 +1,108 @@
-# Kafka to Flink Sandbox
+# E-Commerce Streaming GMV & Data Quality Pipeline
 
-Simple Java project for learning the Flink DataStream API with Kafka.
-
-Flow:
+A real-time order pipeline built with Apache Flink and Kafka. It reads raw order events, rejects bad data, removes duplicates and computes GMV (gross merchandise value) per currency in 1-minute event-time windows.
 
 ```text
-orders Kafka topic
-    -> Flink job
-    -> enriched-orders Kafka topic
-    -> invalid-orders Kafka topic
-    -> gmv-by-minute Kafka topic
+                         ┌──────────────────────── Flink job ────────────────────────┐
+                         │                                                            │
+ orders (Kafka) ──► validate ──► deduplicate ──┬──► add processedAt ──► enriched-orders
+   ▲                  │          (keyed state)  │
+   │                  │               │         └──► payment-completed ──► 1-min window
+   │                  ▼               ▼                                    by currency
+ Python generator   invalid-orders (dead-letter topic, with a reason)          │
+ + Java producer                                                               ▼
+                                                                         gmv-by-minute
 ```
 
-The Flink job reads each order as JSON, validates it, deduplicates by `eventId`, adds learning fields, and writes results back to Kafka.
+## What the job does
 
-## Learning Mode
+**Validation.** Every event is parsed and checked before it reaches the business logic. Events with malformed JSON, missing `eventId` / `orderId` / `userId` / `currency` / `eventTime`, a non-numeric or non-positive `amount`, or an unknown `eventType` are not dropped. They are sent to the `invalid-orders` topic with the original payload, a machine-readable reason (`malformed-json`, `non-positive-amount`, `unknown-eventType` ...) and a timestamp, so they can be inspected and replayed later.
 
-This repository is a Flink learning sandbox first. The bigger e-commerce platform idea lives in `PROJECT.md`, but the current goal is smaller:
+**Deduplication.** Producers retry, so the same event can arrive twice. The stream is keyed by `eventId`, and a `ValueState<Boolean>` remembers which ids were already seen. Repeats go to the dead-letter topic as `duplicate-event`. The state has a 1-hour TTL, so it does not grow forever.
 
-```text
-learn one Flink concept
-    -> make one tiny code change
-    -> run it locally
-    -> inspect the Kafka output
-```
+**Event time and watermarks.** Timestamps come from the order's own `eventTime`, not from the time Flink happens to process it. A bounded out-of-orderness watermark allows events to arrive up to 10 seconds late and still land in the correct window.
 
-For now, do not rush into ClickHouse, Airflow, Delta Lake, or FastAPI. First, get comfortable with the core Flink shape:
-
-```text
-Source -> DataStream -> Transformation -> Sink
-```
-
-## Lesson 1: Job Anatomy + Map
-
-Purpose:
-
-- Understand where a Flink job starts.
-- See how Kafka becomes a Flink `DataStream`.
-- Practice `map`, which transforms every event one by one.
-
-In `OrderStreamingJob.java`, focus on these parts:
-
-- `StreamExecutionEnvironment`: the Flink job builder.
-- `KafkaSource`: reads from the `orders` topic.
-- `DataStream<String>`: the stream of raw JSON order events.
-- `.map(OrderStreamingJob::addProcessedAt)`: adds processing-time metadata.
-- `.map(OrderStreamingJob::addLearningStepForLessonOne)`: adds a simple learning marker.
-- `KafkaSink`: writes to the `enriched-orders` topic.
-
-Acceptance check:
-
-When you send sample orders, each message in `enriched-orders` should contain:
+**GMV windows.** Only `payment-completed` events count as revenue. They are keyed by currency and aggregated in 1-minute tumbling event-time windows with an incremental `AggregateFunction`, so the window keeps a running sum and count instead of buffering every event. Each closed window is written to `gmv-by-minute`, for example:
 
 ```json
-{
-  "processedAt": "...",
-  "learningStep": "map-course"
-}
+{"windowStart":"2026-05-09T12:00:00Z","windowEnd":"2026-05-09T12:01:00Z","currency":"TRY","totalGmv":4821.4,"orderCount":5,"updatedAt":"..."}
 ```
 
-## What You Need
-
-Only Docker is required. Java and Maven run inside Docker.
-
-## Start Services
-
-```bash
-docker compose up -d
-```
-
-Kafka topic and broker state are stored in a named Docker volume, so they persist across `docker compose down` and `docker compose up -d`.
-If you run `docker compose down -v`, volumes are deleted and topics must be created again.
-
-Useful UIs:
-
-- Flink UI: http://localhost:8081
-- Kafka UI: http://localhost:8080
-
-## Build The Job
-
-```bash
-docker run --rm \
-  -v "$PWD":/workspace \
-  -w /workspace \
-  maven:3.9.9-eclipse-temurin-17 \
-  mvn clean package
-```
-
-The jar will be created here:
-
-```text
-target/flink-kafka-sandbox.jar
-```
+**Fault tolerance.** Checkpointing runs every 10 seconds in exactly-once mode, so the dedup state, open windows and Kafka offsets are restored together after a failure.
 
 ## Topics
 
-Create topics once after first startup (or after `docker compose down -v`).
+| Topic | Content |
+|---|---|
+| `orders` | Raw order events (input) |
+| `enriched-orders` | Valid, unique events with a `processedAt` field |
+| `invalid-orders` | Dead-letter topic: bad and duplicate events with a reason |
+| `gmv-by-minute` | GMV and order count per currency, per minute |
+
+## Test data
+
+`scripts/generate_orders.py` produces a continuous stream of realistic orders and deliberately mixes in problems: negative amounts, missing currency, unknown event types, broken JSON and exact duplicates. Generation stays in Python, publishing stays in Java (`JsonLinesKafkaProducer`); `scripts/run_orders_pipeline.sh` pipes one into the other.
+
+`samples/orders.jsonl` holds a small fixed set of events for quick manual checks.
+
+## Running locally
+
+Only Docker is needed; Java 17 and Maven run in containers.
 
 ```bash
-docker compose exec kafka kafka-topics \
-  --bootstrap-server kafka:29092 \
-  --create --if-not-exists \
-  --topic orders \
-  --partitions 3 \
-  --replication-factor 1
+# 1. Start Kafka, Flink (JobManager + TaskManager) and Kafka UI
+docker compose up -d
 
-docker compose exec kafka kafka-topics \
-  --bootstrap-server kafka:29092 \
-  --create --if-not-exists \
-  --topic enriched-orders \
-  --partitions 3 \
-  --replication-factor 1
+# 2. Build the job
+docker run --rm -v "$PWD":/workspace -w /workspace maven:3.9.9-eclipse-temurin-17 mvn clean package
 
-docker compose exec kafka kafka-topics \
-  --bootstrap-server kafka:29092 \
-  --create --if-not-exists \
-  --topic invalid-orders \
-  --partitions 3 \
-  --replication-factor 1
+# 3. Create the topics (once)
+for t in orders enriched-orders invalid-orders gmv-by-minute; do
+  docker compose exec kafka kafka-topics --bootstrap-server kafka:29092 \
+    --create --if-not-exists --topic "$t" --partitions 3 --replication-factor 1
+done
 
-docker compose exec kafka kafka-topics \
-  --bootstrap-server kafka:29092 \
-  --create --if-not-exists \
-  --topic gmv-by-minute \
-  --partitions 3 \
-  --replication-factor 1
+# 4. Submit the job
+docker compose exec jobmanager flink run /opt/flink/usrlib/flink-kafka-sandbox.jar
+
+# 5. Send data
+bash scripts/run_orders_pipeline.sh          # continuous generator
+# or a fixed sample:
+cat samples/orders.jsonl | docker compose exec -T kafka \
+  kafka-console-producer --bootstrap-server kafka:29092 --topic orders
+
+# 6. Watch the results
+docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:29092 \
+  --topic gmv-by-minute --from-beginning
 ```
 
-To verify:
+Flink UI: http://localhost:8081 (checkpoints, watermarks, operator metrics)
+Kafka UI: http://localhost:8080
 
-```bash
-docker compose exec kafka kafka-topics \
-  --bootstrap-server kafka:29092 \
-  --list
-```
+Kafka data is kept in a named volume; `docker compose down -v` removes it.
 
-## Run The Flink Job
-
-```bash
-docker compose exec jobmanager flink run \
-  /opt/flink/usrlib/flink-kafka-sandbox.jar
-```
-
-## Send Sample Orders
-
-```bash
-cat samples/orders.jsonl | docker compose exec -T kafka kafka-console-producer \
-  --bootstrap-server kafka:29092 \
-  --topic orders
-```
-
-For the best practice setup, keep data generation in Python and Kafka publishing in Java, but run them through one script:
-
-```bash
-bash scripts/run_orders_pipeline.sh
-```
-
-Environment variables you can override:
-
-- `KAFKA_BOOTSTRAP_SERVERS` defaults to `localhost:9092`
-- `KAFKA_TOPIC` defaults to `orders`
-- `PYTHON_BIN` defaults to `python3`
-- `JAVA_BIN` defaults to `java`
-- `JAR_PATH` defaults to `target/flink-kafka-sandbox.jar`
-
-This keeps the generator independent from Kafka while giving you one repeatable command for local runs.
-
-## Read The Output
-
-```bash
-docker compose exec kafka kafka-console-consumer \
-  --bootstrap-server kafka:29092 \
-  --topic enriched-orders \
-  --from-beginning
-```
-
-You should see the original order JSON plus a new `processedAt` field.
-
-To read invalid or duplicate events:
-
-```bash
-docker compose exec kafka kafka-console-consumer \
-  --bootstrap-server kafka:29092 \
-  --topic invalid-orders \
-  --from-beginning
-```
-
-To read 1-minute GMV window results:
-
-```bash
-docker compose exec kafka kafka-console-consumer \
-  --bootstrap-server kafka:29092 \
-  --topic gmv-by-minute \
-  --from-beginning
-```
-
-## Lesson: Checkpoint, Watermark, Deduplication
-
-What changed in the Flink job:
-
-- Checkpointing is enabled every 10 seconds in Java and Docker Compose.
-- Watermarks are assigned from the order `eventTime` field with 10 seconds of allowed out-of-order data.
-- Invalid records go to `invalid-orders`.
-- Duplicate records are detected with keyed state by `eventId`.
-- `payment-completed` events are aggregated into 1-minute event-time GMV windows by `currency`.
-
-Interview mental model:
-
-- Checkpoint: Flink snapshots state and Kafka source progress so it can recover after failure.
-- Watermark: Flink's event-time progress signal; it tells event-time windows when enough data has arrived.
-- Deduplication: a stateful operation; key by a unique event id, remember seen ids with TTL, and route repeated ids away from the clean stream.
-
-Small experiments:
-
-1. Open Flink UI and check the job's Checkpoints tab after the job runs for more than 10 seconds.
-2. Send the same JSON line twice with the same `eventId`; the second one should appear in `invalid-orders` with `reason=duplicate-event`.
-3. Send `payment-completed` events with close `eventTime` values; after the watermark passes the minute boundary, read `gmv-by-minute`.
-4. Send malformed JSON or a negative `amount`; it should go to `invalid-orders`.
-
-## Code To Study
-
-Start here:
+## Code layout
 
 ```text
-src/main/java/com/example/flinkkafkasandbox/OrderStreamingJob.java
-```
-
-Read it as the table of contents for the Flink job:
-
-- `env.enableCheckpointing(...)`: checkpoint and recovery lesson.
-- `KafkaTopics.ordersSource()`: Kafka source setup.
-- `OrderEventTime.watermarkStrategy()`: event-time and watermark lesson.
-- `InvalidOrderRouter`: validation and DLQ lesson.
-- `DeduplicateByEventId`: keyed state and deduplication lesson.
-- `GmvAggregate` + `AddGmvWindowMetadata`: event-time window aggregation lesson.
-- `KafkaTopics.stringSink(...)`: Kafka sink setup.
-
-Then open only the file for the concept you are studying:
-
-```text
-JobConfig.java               constants: topics, checkpoint/window timing knobs
-KafkaTopics.java             Kafka source/sink builders
-OrderJson.java               JSON parsing and small JSON transformations
-OrderValidator.java          business validation rules
-InvalidOrderRouter.java      valid stream vs DLQ side output
+OrderStreamingJob.java       wires the pipeline: source → validate → dedup → sinks and windows
+OrderValidator.java          validation rules and reasons
+InvalidOrderRouter.java      splits valid events from the dead-letter side output
+DeduplicateByEventId.java    keyed ValueState with TTL
 OrderEventTime.java          eventTime extraction and watermark strategy
-DeduplicateByEventId.java    keyBy(eventId) + ValueState TTL
-GmvAggregate.java            adds amount values inside a window
-AddGmvWindowMetadata.java    turns a closed window into output JSON
+GmvAggregate.java            incremental sum and count inside a window
+AddGmvWindowMetadata.java    turns a closed window into the output record
+KafkaTopics.java             Kafka source and sink builders
+JobConfig.java               topic names, lateness, dedup TTL
 ```
 
-The best way to learn this code is not to read every file at once. Follow one path:
+## Stack
 
-```text
-Checkpoint:
-  OrderStreamingJob.java -> Flink UI Checkpoints tab
+Java 17 · Apache Flink 1.20 (DataStream API) · Apache Kafka (Confluent 7.6) · Jackson · Python · Docker Compose
 
-Watermark:
-  OrderStreamingJob.java -> OrderEventTime.java -> gmv-by-minute output
+## Next steps
 
-Deduplication:
-  OrderStreamingJob.java -> DeduplicateByEventId.java -> invalid-orders output
-```
-
-## Practice Ideas
-
-Try these changes manually:
-
-1. Change the output topic name.
-2. Add a new field like `sourceSystem`.
-3. Filter only `payment-completed` events.
-4. Increase `--parallelism` and compare it with Kafka partition count.
-5. Send broken JSON and observe that the job fails. Then decide how you would handle invalid events.
-
-## Stop Services
-
-```bash
-docker compose down
-```
-
-To delete container state too:
-
-```bash
-docker compose down -v
-```
+- Switch the Kafka sinks to transactional `EXACTLY_ONCE` delivery so outputs match the exactly-once checkpoints end to end.
+- Handle events that arrive after the watermark (allowed lateness or a late-data side output) instead of dropping them.
+- Run with parallelism above 1 and match it to the topic partitions.
+- Add unit tests for the validator and window logic with Flink's test harness.
+- Load the GMV stream into ClickHouse for dashboards.

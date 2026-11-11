@@ -22,12 +22,6 @@ public final class OrderJson {
         return JSON.writeValueAsString(order);
     }
 
-    public static String addLearningStep(String rawJson) throws Exception {
-        ObjectNode order = (ObjectNode) JSON.readTree(rawJson);
-        order.put("learningStep", "map-course");
-        return JSON.writeValueAsString(order);
-    }
-
     public static String invalidOrder(String rawPayload, String reason) throws Exception {
         ObjectNode invalidOrder = JSON.createObjectNode();
         invalidOrder.put("reason", reason);
